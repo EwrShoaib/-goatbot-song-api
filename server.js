@@ -1,5 +1,10 @@
+
 const express = require("express");
 const { spawn } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,46 +20,86 @@ app.get("/api/song", (req, res) => {
   }
 
   const query = String(req.query.q || "").trim();
+
   if (!query) {
-    return res.status(400).json({ error: "Song name is required" });
+    return res.status(400).json({
+      error: "Song name is required"
+    });
   }
 
-  res.setHeader("Content-Type", "audio/mpeg");
-  res.setHeader(
-    "Content-Disposition",
-    'attachment; filename="song.mp3"'
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "song-")
   );
+  const output = path.join(dir, "song.%(ext)s");
+  let finished = false;
+
+  const cleanup = () => {
+    if (finished) return;
+    finished = true;
+    fs.rm(dir, { recursive: true, force: true }, () => {});
+  };
 
   const child = spawn("yt-dlp", [
     "--no-playlist",
     "--extract-audio",
     "--audio-format", "mp3",
-    "--output", "-",
+    "--output", output,
     `ytsearch1:${query}`
   ]);
 
-  child.stdout.pipe(res);
+  let errorText = "";
 
   child.stderr.on("data", data => {
+    errorText += data.toString();
     console.error(data.toString());
   });
 
   child.on("error", err => {
     console.error(err);
-    if (!res.headersSent) res.status(500).json({ error: "yt-dlp failed" });
-    else res.destroy(err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Could not start yt-dlp" });
+    }
+    cleanup();
   });
 
   child.on("close", code => {
-    if (code !== 0) {
-      console.error("yt-dlp exit code:", code);
-      if (!res.headersSent) res.status(500).end();
-      else res.destroy();
+    if (res.destroyed) {
+      cleanup();
+      return;
     }
+
+    if (code !== 0) {
+      console.error("yt-dlp exit code:", code, errorText);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Song download failed" });
+      } else {
+        res.end();
+      }
+      cleanup();
+      return;
+    }
+
+    const file = path.join(dir, "song.mp3");
+
+    if (!fs.existsSync(file)) {
+      res.status(500).json({ error: "MP3 file was not created" });
+      cleanup();
+      return;
+    }
+
+    res.download(file, "song.mp3", err => {
+      if (err && !res.destroyed) {
+        console.error(err);
+      }
+      cleanup();
+    });
   });
 
-  req.on("close", () => {
-    if (!res.writableEnded) child.kill();
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      child.kill();
+      cleanup();
+    }
   });
 });
 
